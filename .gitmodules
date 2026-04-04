@@ -1,0 +1,4 @@
+[submodule "ArmyHeart"]
+	path = ArmyHeart
+	url = https://github.com/DerangedIons/ArmyHeart.git
+	branch = jtg-runpod-unified-cached-prepace
