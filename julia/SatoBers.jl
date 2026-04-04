@@ -124,6 +124,11 @@ Base.@kwdef struct SatoBersModel{T}
     cup::T = T(0.5)
     vup::T = T(0.250)   # 250 µM/s → 0.250 µM/ms
 
+    # SR Ca²⁺ release gain (g_rel = 250 * 0.3 = 75.0 µM/ms by default)
+    # Corresponds to GRyR in pharmacological intervention figures.
+    # Increasing g_rel destabilizes Ca²⁺ cycling; decreasing it stabilizes.
+    g_rel::T = T(75.0)
+
     # Stochastic gating
     N_CaL::Int = 100000
 end
@@ -187,7 +192,7 @@ function cell_rhs_deterministic!(du, u, model::SatoBersModel, stimulus=0.0)
         # Unpack model parameters (destructured for concise notation)
         (; F, F2, R, Temp, K_in, Na_out, K_out, Ca_outmM, Na_in,
            gna, gk1, gkr, gks, gto, gnaca, gkp, icabar,
-           tauf, av, gam, taujj, cup, vup) = model
+           tauf, av, gam, taujj, cup, vup, g_rel, N_CaL) = model
 
         # ===============================================================
         # Fast Sodium Current (INa) — Hodgkin-Huxley formulation
@@ -280,7 +285,6 @@ function cell_rhs_deterministic!(du, u, model::SatoBersModel, stimulus=0.0)
             end
         Q *= 0.001
 
-        g_rel  = 250 * 0.3   # Release gain scaling factor (µM/ms)
         taur   = 20.0        # Release current decay time constant (ms)
         dIr = -g_rel * jca * Q / icabar - Ir / taur  # Trigger + exponential decay
 
