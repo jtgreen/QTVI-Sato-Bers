@@ -97,7 +97,8 @@ function SatoBersArmyModel(;
     )
     n = nx * ny
     seed = UInt32(0x6B8B4567)
-    rng_states = UInt32[seed ⊻ UInt32(i * 0x27220A95 + 0x374761A1) for i in 1:n]
+    # UInt32 arithmetic wraps around mod 2^32 — correct for PRNG seeds
+    rng_states = UInt32[seed ⊻ (UInt32(i % typemax(UInt32)) * UInt32(0x27220A95) + UInt32(0x374761A1)) for i in 1:n]
     return SatoBersArmyModel{Float64, Vector{UInt32}}(
         sato, rng_states, nx, ny, Float64(dx), Float64(dy), Float64(dt),
         Float64(bcl), Float64(stim_amp), Float64(stim_dur), Float64(corner_mm),
