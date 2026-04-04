@@ -166,17 +166,24 @@ function tissue_step!(U    ::Array{Float64, 3},
         # Compute deterministic RHS
         cell_rhs_deterministic!(du_buf, u_buf, model, stim)
 
-        # Stochastic gate update (modifies u_buf and du_buf in-place)
+        # Stochastic gate update (modifies u_buf[7,8,9] in-place and zeros du_buf[7,8,9])
         if model.N_CaL > 0
             rng = StochasticState(RNG[i, j])
             stochastic_gate_update!(u_buf, du_buf, DT, model, rng)
-            RNG[i, j] = rng.state
+            RNG[i, j] = rng.xsx   # save updated PRNG state (field is .xsx, not .state)
         end
 
-        # Forward Euler: update all state variables except V (k=1)
-        # V update is deferred until diffusion is added
+        # Forward Euler: update all state variables except V (k=1) and stochastic gates
+        # Stochastic gates (k=7,8,9) were already updated in u_buf by stochastic_gate_update!
+        # du_buf[7,8,9] were zeroed, so `U[i,j,k] += du_buf[k]*DT` is a no-op for them.
         for k in 2:15
             U[i, j, k] += du_buf[k] * DT
+        end
+        # Copy stochastic gate values directly from u_buf (bypasses du_buf)
+        if model.N_CaL > 0
+            U[i, j, 7] = u_buf[7]   # f gate
+            U[i, j, 8] = u_buf[8]   # q gate
+            U[i, j, 9] = u_buf[9]   # d gate
         end
         # Store ionic dV for later addition with diffusion
         dV_diff[i, j] = du_buf[1] * DT  # ionic contribution to ΔV
@@ -454,8 +461,11 @@ let
     for tn in 0:BCLn-1
         tissue_step!(U, RNG, dV, u_buf, du_buf, model, 5*BCLn + tn)
         if tn in snap_tn
-            t_val = snap_ms[findfirst(==(tn), round.(Int, snap_ms ./ DT))]
-            snap_V[t_val] = copy(view(U, :, :, 1))
+            idx = findfirst(==(tn), round.(Int, snap_ms ./ DT))
+            if idx !== nothing
+                t_val = snap_ms[idx]
+                snap_V[t_val] = copy(view(U, :, :, 1))
+            end
         end
     end
 
