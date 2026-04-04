@@ -10,19 +10,19 @@ The Julia version will be structured for use with **Thunderbolt.jl**.
 - [x] Analyze C++ source (cell.h, cell.cc, 0d.cc)
 - [x] Create `python/cell.py` — Cell class with all ion currents, Ca handling, stochastic gating
 - [x] Create `python/simulation.py` — Parameter sweep (tauf 20–60), APD/CaMax measurement
-- [ ] Validate Python output against C++ results
+- [x] Validate Python output against C++ results
 
 ### Phase 2: Julia Conversion (Thunderbolt.jl)
 - [x] Create `julia/SatoBers.jl` — Module with cell model
 - [x] Create `julia/simulation.jl` — Standalone simulation
-- [ ] Integrate with Thunderbolt.jl cell model interface
-- [ ] Validate Julia output against C++/Python results
+- [x] Integrate with Thunderbolt.jl cell model interface
+- [x] Validate Julia output against C++/Python results
 
 ### Phase 3: Validation & Testing
-- [ ] Run C++ reference simulation, save output
-- [ ] Compare Python output (should match C++ exactly for deterministic mode)
-- [ ] Compare Julia output
-- [ ] Document any numerical differences (expected with stochastic mode)
+- [x] Run C++ reference simulation, save output
+- [x] Compare Python output (should match C++ exactly for deterministic mode)
+- [x] Compare Julia output
+- [x] Document any numerical differences (expected with stochastic mode)
   
 ### Phase 4: Comparison with "sato QTVI.pdf" figures
 - [ ] Reproduce key figures from the paper (APD restitution, Ca handling, etc.)

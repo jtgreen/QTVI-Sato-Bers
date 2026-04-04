@@ -78,6 +78,7 @@ using StaticArrays
 
 export SatoBersModel, num_states, default_initial_state, transmembranepotential_index
 export cell_rhs!, cell_rhs_deterministic!
+export StochasticState, xorshift!, stochastic_gate_update!
 
 # ============================================================================
 # Model struct — compatible with Thunderbolt.jl AbstractIonicModel pattern
