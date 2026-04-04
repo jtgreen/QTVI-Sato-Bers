@@ -24,10 +24,41 @@ The Julia version will be structured for use with **Thunderbolt.jl**.
 - [x] Compare Julia output
 - [x] Document any numerical differences (expected with stochastic mode)
   
-### Phase 4: Comparison with "sato QTVI.pdf" figures
-- [x] Reproduce key figures from the paper (APD restitution, Ca handling, etc.)
-- [x] Single cell
-- [x] Tissue (note, ArmyHeart is a submodule and has the capacity to run cables and 2d tissue along w/ code for calculating the pseudo-ECG and QTVI)
+### Phase 4: Single-Cell Figures (paper Figs 1–4)
+- [x] Reproduce key single-cell figures from the paper
+- [x] Fig 2A / 4A: APD variability + restitution slope vs τ_f (voltage instability)
+- [x] Fig 2B: APD vs beat number at selected τ_f
+- [x] Fig 3 / 4B / 4C: Ca²⁺ variability vs u (Ca²⁺ instability), both I-clamp and AP-clamp
+- [x] Fig A1: AP + Ca²⁺ traces (stable, voltage-driven, Ca-driven instability)
+
+### Phase 5: Pharmacological Intervention Figures (paper Figs 5–10 / A3)
+- [ ] Fig A3 / 5–10: APD variability when ion channel conductances are varied
+  - [ ] GRyR ×120%: stabilizes Ca²⁺ cycling → reduces Ca²⁺-driven variability
+  - [ ] GKr ×50% (reduce): flattens APD restitution → reduces voltage-driven variability
+  - [ ] GKs ×50% (reduce): flattens APD restitution → reduces voltage-driven variability
+  - [ ] GCaL reduction: reduces both Ca²⁺ cycling and voltage instability
+  - [ ] GNa increase: minimal effect on both
+- [ ] Show differential response: Ca²⁺ stabilization vs. voltage stabilization
+
+### Phase 6: 2D Tissue Simulation (paper Fig A2)
+- [ ] Implement 2D monodomain tissue (3cm × 3cm, dx=0.5mm → 60×60 cells)
+- [ ] Corner pacing stimulus
+- [ ] Far-field pseudo-ECG at recording site
+- [ ] Sweep τ_f → QTV vs τ_f curve (Fig A2C)
+- [ ] Sweep u → QTV vs u curve (Fig A2D)
+- [ ] Generate representative ECG traces (Fig A2B)
+- [ ] Plot 2D tissue snapshot showing activation pattern
+- [ ] **ArmyHeart integration** (blocked pending token access to DerangedIons/ArmyHeart.jl)
+  - [x] SatoBers.jl implements required Thunderbolt.jl interface (cell_rhs!, etc.)
+  - [ ] Wire up ArmyHeart.Cable1D / ArmyHeart.Tissue2D once access is granted
+  - [ ] GPU acceleration via ArmyHeart + CUDA
+
+### Phase 7: Infrastructure
+- [ ] Fix git push (403 — fine-grained PAT needs Contents:write on QTVI-Sato-Bers)
+- [ ] Get ArmyHeart.jl access (token needs DerangedIons org scope)
+- [ ] Create PR once push works
+
+---
 
 ## Single-Cell Figures Generated
 
@@ -40,7 +71,7 @@ and plotted by `figures/plot_figures.py` (Python, matplotlib).
 | `fig1_stability_boundary.png` | Alternans onset vs tauf and u | Fig 1 |
 | `fig2_tauf_sweep.png` | APD bifurcation + variability vs τ_f | Fig 2A / 4A |
 | `fig3_u_sweep.png` | Ca²⁺/APD bifurcation + variability vs u | Fig 3 / 4B / 4C |
-| `fig4_ap_traces.png` | Action potential + Ca transient traces | - |
+| `fig4_ap_traces.png` | Action potential + Ca transient traces | Fig A1 |
 | `fig5_apd_per_beat.png` | APD vs beat number at selected τ_f | Fig 2B |
 | `fig6_ca_per_beat.png` | Ca²⁺ peak per beat (AP-clamp, varied u) | Fig 3B |
 
@@ -52,7 +83,7 @@ and plotted by `figures/plot_figures.py` (Python, matplotlib).
 - Ca²⁺ instability in AP-clamp is independent of voltage variability ✓
 - Stochastic gating (N_CaL=100000) produces ~0.5-1 ms APD variability in stable regime ✓
 
-## Tissue Simulation (COMPLETE)
+## 1D Tissue Simulation (self-contained; ArmyHeart integration TBD)
 
 `julia/tissue_simulation.jl` implements self-contained 1D cable tissue simulation:
 - Monodomain cable equation (finite difference, forward Euler, DX=0.5mm, DT=0.05ms)
@@ -61,7 +92,7 @@ and plotted by `figures/plot_figures.py` (Python, matplotlib).
 - Pseudo-ECG via Plonsey (1964) far-field formula
 - QTVI computation from beat-to-beat QT variability
 
-**Note**: ArmyHeart submodule (DerangedIons/ArmyHeart) is private/inaccessible.
+**Note**: ArmyHeart submodule (DerangedIons/ArmyHeart.jl) is private/inaccessible.
 The simulation replicates that functionality directly.
 The `SatoBers.jl` module already implements the required Thunderbolt.jl cell interface
 (`num_states`, `default_initial_state`, `transmembranepotential_index`, `cell_rhs!`),
@@ -73,13 +104,20 @@ so ArmyHeart integration will work once access is available.
 - Action potential propagation confirmed: wavefront travels full 50mm cable
 - Pseudo-ECG shows clear QRS and T-wave morphology
 
-### Tissue figures generated:
-| File | Content |
-|------|---------|
-| `fig7_tissue_variability.png` | SC vs tissue APD variability + QTVI vs τ_f |
-| `fig8_tissue_ecg.png` | Pseudo-ECG traces (stable + near alternans) + cable snapshot |
+### 1D tissue figures generated:
+| File | Content | Paper figure |
+|------|---------|--------------|
+| `fig7_tissue_variability.png` | SC vs tissue APD variability + QTVI vs τ_f | partial A2C |
+| `fig8_tissue_ecg.png` | Pseudo-ECG traces (stable + near alternans) + cable snapshot | partial A2B |
+
+## 2D Tissue Simulation (PENDING — paper Fig A2)
+
+Paper simulates 3cm × 3cm tissue with:
+- Corner pacing, far-field ECG measurement
+- QTV vs τ_f (Fig A2C) and QTV vs u (Fig A2D)
+- This requires ~60×60=3600 cells, many beats → GPU helpful
 
 ## Notes
 - Stochastic gating uses xorshift RNG + Box-Muller transform — must match seed behavior across languages for reproducibility
 - Forward Euler with dt=0.05 ms — consider offering RK4 or adaptive methods in Julia
-- Thunderbolt.jl integration TBD — need to understand their cell model interface
+- Thunderbolt.jl integration via ArmyHeart.jl — access pending
