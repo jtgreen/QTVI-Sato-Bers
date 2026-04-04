@@ -630,6 +630,189 @@ def fig_summary():
 
 
 # =============================================================================
+# Figure 7 — Tissue vs Single-Cell APD Variability + QTVI
+# =============================================================================
+def fig_tissue_variability():
+    """
+    Tissue coupling reduces APD variability (electrotonic averaging).
+    QTVI rises sharply as alternans bifurcation is approached.
+
+    Panels:
+      A (left):  APD std vs tauf — single cell (blue) vs tissue (orange)
+      B (middle): APD mean vs tauf — single cell vs tissue
+      C (right): QTVI vs tauf — shows diagnostic value of pseudo-ECG
+    """
+    data = load_csv('tissue_apd_variability.csv')
+
+    tauf     = [r['tauf']         for r in data]
+    sc_mean  = [r['sc_apd_mean']  for r in data]
+    sc_std   = [r['sc_apd_std']   for r in data]
+    tis_mean = [r['tis_apd_mean'] for r in data]
+    tis_std  = [r['tis_apd_std']  for r in data]
+    qt_mean  = [r['qt_mean']      for r in data]
+    qt_std   = [r['qt_std']       for r in data]
+    qtvi     = [r['qtvi']         for r in data]
+
+    # Mask NaN
+    valid_mask = [not (np.isnan(m) or np.isnan(s))
+                  for m, s in zip(tis_mean, tis_std)]
+    tauf_v     = [tauf[i]     for i in range(len(tauf)) if valid_mask[i]]
+    tis_mean_v = [tis_mean[i] for i in range(len(tauf)) if valid_mask[i]]
+    tis_std_v  = [tis_std[i]  for i in range(len(tauf)) if valid_mask[i]]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    fig.suptitle('Tissue Coupling Reduces APD Variability (1D Cable, N=100 cells, D=0.1 mm²/ms)',
+                 fontsize=11, fontweight='bold')
+
+    # Panel A: APD std comparison
+    ax = axes[0]
+    ax.plot(tauf, sc_std, 'bo-', markersize=5, linewidth=1.5, label='Single cell')
+    ax.plot(tauf_v, tis_std_v, 's-', color='darkorange', markersize=5,
+            linewidth=1.5, label='Tissue (mid-cell)')
+    ax.set_xlabel('τ_f (ms; LTCC recovery)')
+    ax.set_ylabel('APD std (ms)')
+    ax.set_title('APD Variability: Single Cell vs Tissue\n(N_CaL=100,000, BCL=300 ms)')
+    ax.legend(loc='upper left')
+    ax.set_ylim(bottom=0)
+    # Mark alternans onset
+    for tf, sc_s in zip(tauf, sc_std):
+        if sc_s > 5.0:
+            ax.axvline(tf, color='grey', linestyle='--', alpha=0.5, lw=1)
+            ax.annotate('↑ alternans\nonset', xy=(tf + 0.3, max(sc_std) * 0.6),
+                        fontsize=7.5, color='grey')
+            break
+
+    # Panel B: APD mean comparison
+    ax = axes[1]
+    ax.plot(tauf, sc_mean, 'bo-', markersize=5, linewidth=1.5, label='Single cell')
+    ax.plot(tauf_v, tis_mean_v, 's-', color='darkorange', markersize=5,
+            linewidth=1.5, label='Tissue (mid-cell)')
+    ax.set_xlabel('τ_f (ms; LTCC recovery)')
+    ax.set_ylabel('Mean APD (ms)')
+    ax.set_title('Mean APD: Single Cell vs Tissue')
+    ax.legend(loc='upper left')
+    ax.annotate('Electrotonic\ncoupling shortens\neffective APD',
+                xy=(0.05, 0.25), xycoords='axes fraction',
+                fontsize=8, color='darkorange',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.5))
+
+    # Panel C: QTVI vs tauf
+    ax = axes[2]
+    ax.plot(tauf, qtvi, 'k^-', markersize=6, linewidth=1.5, label='QTVI (paced)')
+    ax.set_xlabel('τ_f (ms; LTCC recovery)')
+    ax.set_ylabel('QTVI')
+    ax.set_title('QT Variability Index vs τ_f\n(from pseudo-ECG, constant BCL)')
+    # Shade stable vs alternans regions
+    qtvi_arr = np.array(qtvi)
+    tauf_arr = np.array(tauf)
+    thresh = 8.0   # approximate QTVI threshold separating regimes
+    ax.axhline(thresh, color='red', linestyle='--', alpha=0.5, lw=1,
+               label=f'QTVI={thresh} (onset threshold)')
+    ax.fill_between(tauf_arr, -15, qtvi_arr,
+                    where=(qtvi_arr < thresh), alpha=0.15, color='steelblue',
+                    label='Stable regime')
+    ax.fill_between(tauf_arr, -15, qtvi_arr,
+                    where=(qtvi_arr >= thresh), alpha=0.15, color='firebrick',
+                    label='Alternans regime')
+    ax.set_ylim(bottom=min(qtvi) - 0.5)
+    ax.legend(loc='lower right', fontsize=7)
+
+    plt.tight_layout()
+    outfile = os.path.join(OUT_DIR, 'fig7_tissue_variability.png')
+    fig.savefig(outfile, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved: {outfile}')
+
+
+# =============================================================================
+# Figure 8 — Pseudo-ECG traces + Cable propagation snapshot
+# =============================================================================
+def fig_tissue_ecg():
+    """
+    Pseudo-ECG from 1D cable simulation (Plonsey 1964 far-field formula).
+
+    Panel A (top-left):   ECG trace — stable regime (tauf=30 ms)
+    Panel B (top-right):  ECG trace — near alternans (tauf=52 ms)
+    Panel C (bottom):     Cable voltage snapshot — AP propagation at tauf=40 ms
+    """
+    fig = plt.figure(figsize=(14, 8))
+    gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.35)
+
+    # --- ECG stable (tauf=30) ---
+    ecg30_path = os.path.join(DATA_DIR, 'tissue_ecg_tauf30.csv')
+    if os.path.exists(ecg30_path):
+        ecg30 = load_csv('tissue_ecg_tauf30.csv')
+        t30   = [r['t_ms']  for r in ecg30]
+        e30   = [r['ecg_mV'] for r in ecg30]
+        ax = fig.add_subplot(gs[0, 0])
+        ax.plot(t30, e30, 'steelblue', lw=1.2)
+        ax.axhline(0, color='grey', lw=0.5, ls=':')
+        ax.set_xlabel('Time (ms)')
+        ax.set_ylabel('Pseudo-ECG (mV)')
+        ax.set_title('Pseudo-ECG — Stable regime\n(τ_f = 30 ms, BCL = 300 ms)')
+        # Annotate QRS and T wave
+        e_arr = np.array(e30)
+        ax.annotate('QRS', xy=(t30[np.argmax(np.abs(e_arr[:100]))], e_arr[:100].max()),
+                    xytext=(15, e_arr.max() * 1.1),
+                    fontsize=8, color='steelblue',
+                    arrowprops=dict(arrowstyle='->', color='steelblue', lw=0.8))
+
+    # --- ECG near alternans (tauf=52) ---
+    ecg52_path = os.path.join(DATA_DIR, 'tissue_ecg_tauf52.csv')
+    if os.path.exists(ecg52_path):
+        ecg52 = load_csv('tissue_ecg_tauf52.csv')
+        t52   = [r['t_ms']   for r in ecg52]
+        e52   = [r['ecg_mV'] for r in ecg52]
+        ax = fig.add_subplot(gs[0, 1])
+        ax.plot(t52, e52, 'firebrick', lw=1.2)
+        ax.axhline(0, color='grey', lw=0.5, ls=':')
+        ax.set_xlabel('Time (ms)')
+        ax.set_ylabel('Pseudo-ECG (mV)')
+        ax.set_title('Pseudo-ECG — Near alternans\n(τ_f = 52 ms, BCL = 300 ms)')
+        ax.annotate('QTVI elevated\n(high variability)', xy=(0.6, 0.85),
+                    xycoords='axes fraction', fontsize=8.5, color='firebrick',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='mistyrose', alpha=0.7))
+
+    # --- Cable propagation snapshot ---
+    snap_path = os.path.join(DATA_DIR, 'tissue_cable_snapshot.csv')
+    if os.path.exists(snap_path):
+        snap = load_csv('tissue_cable_snapshot.csv')
+        x_mm = [r['x_mm'] for r in snap]
+
+        # Available time columns
+        time_keys = ['V_t2ms', 'V_t5ms', 'V_t10ms', 'V_t20ms',
+                     'V_t50ms', 'V_t100ms', 'V_t200ms', 'V_t280ms']
+        time_labels = ['2 ms', '5 ms', '10 ms', '20 ms',
+                       '50 ms', '100 ms', '200 ms', '280 ms']
+        colors = plt.cm.plasma(np.linspace(0.05, 0.95, len(time_keys)))
+
+        ax_snap = fig.add_subplot(gs[1, :])
+        for tk, tl, col in zip(time_keys, time_labels, colors):
+            if tk in snap[0]:
+                v_cable = [r[tk] for r in snap]
+                ax_snap.plot(x_mm, v_cable, color=col, lw=1.2, label=f't = {tl}')
+        ax_snap.set_xlabel('Position along cable (mm)')
+        ax_snap.set_ylabel('V_m (mV)')
+        ax_snap.set_title('Action Potential Propagation — 1D Cable\n'
+                          '(τ_f = 40 ms, deterministic, D = 0.1 mm²/ms, N = 100 cells)')
+        ax_snap.legend(ncol=4, fontsize=8, loc='upper right')
+        ax_snap.axhline(-70, color='grey', linestyle=':', lw=0.8, alpha=0.6)
+        ax_snap.annotate('Depolarisation\nwavefront propagates →',
+                         xy=(0.12, 0.65), xycoords='axes fraction',
+                         fontsize=8.5, color='navy',
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.7))
+
+    fig.suptitle('1D Cable Tissue Simulation — Pseudo-ECG and AP Propagation\n'
+                 '(Monodomain, finite-difference, Plonsey 1964 pseudo-ECG formula)',
+                 fontsize=11, fontweight='bold')
+
+    outfile = os.path.join(OUT_DIR, 'fig8_tissue_ecg.png')
+    fig.savefig(outfile, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved: {outfile}')
+
+
+# =============================================================================
 # Main
 # =============================================================================
 def main():
@@ -645,18 +828,22 @@ def main():
     fig_ca_per_beat()
     fig_stability_boundary()
     fig_summary()
+    fig_tissue_variability()
+    fig_tissue_ecg()
 
     print()
     print("All figures saved to figures/")
     print()
     print("Figure index:")
-    print("  fig0_summary.png       — Summary of all key findings")
+    print("  fig0_summary.png            — Summary of all key findings")
     print("  fig1_stability_boundary.png — Stability boundary (Fig 1)")
-    print("  fig2_tauf_sweep.png    — APD bifurcation + variability vs tauf (Fig 2A/4A)")
-    print("  fig3_u_sweep.png       — Ca/APD bifurcation + variability vs u (Fig 3/4B/4C)")
-    print("  fig4_ap_traces.png     — Action potential traces at different tauf")
-    print("  fig5_apd_per_beat.png  — APD vs beat# for selected tauf (Fig 2B)")
-    print("  fig6_ca_per_beat.png   — Ca2+ peak vs beat# AP-clamp (Fig 3B)")
+    print("  fig2_tauf_sweep.png         — APD bifurcation + variability vs tauf (Fig 2A/4A)")
+    print("  fig3_u_sweep.png            — Ca/APD bifurcation + variability vs u (Fig 3/4B/4C)")
+    print("  fig4_ap_traces.png          — Action potential traces at different tauf")
+    print("  fig5_apd_per_beat.png       — APD vs beat# for selected tauf (Fig 2B)")
+    print("  fig6_ca_per_beat.png        — Ca2+ peak vs beat# AP-clamp (Fig 3B)")
+    print("  fig7_tissue_variability.png — Tissue vs single-cell APD variability + QTVI")
+    print("  fig8_tissue_ecg.png         — Pseudo-ECG traces + cable propagation snapshot")
 
 
 if __name__ == '__main__':
