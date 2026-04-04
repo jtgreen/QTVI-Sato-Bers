@@ -23,6 +23,11 @@ The Julia version will be structured for use with **Thunderbolt.jl**.
 - [ ] Compare Python output (should match C++ exactly for deterministic mode)
 - [ ] Compare Julia output
 - [ ] Document any numerical differences (expected with stochastic mode)
+  
+### Phase 4: Comparison with "sato QTVI.pdf" figures
+- [ ] Reproduce key figures from the paper (APD restitution, Ca handling, etc.)
+- [ ] Single cell
+- [ ] Tissue (note, ArmyHeart is a submodule and has the capacity to run cables and 2d tissue along w/ code for calculating the pseudo-ECG and QTVI)
 
 ## Notes
 - Stochastic gating uses xorshift RNG + Box-Muller transform — must match seed behavior across languages for reproducibility

@@ -49,3 +49,10 @@ julia simulation.jl
 - `av` (u): Ca2+ release function parameter (default 3.0)
 - `bcl`: Basic cycle length (300 ms)
 - `N_CaL`: Number of L-type Ca channels for stochastic gating (100000; set 0 for deterministic)
+
+## THOU SHALT NOT
+- Edit ArmyHeart.jl
+- Only make PRs within this repository
+- code single cell in python and julia and compare to their c++
+- code tissue in Julia only, using ArmyHeart, which extends Thunderbolt.jl
+- Not stop until you have recreated their key figures
