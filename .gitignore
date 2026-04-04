@@ -11,3 +11,29 @@ __pycache__/
 # Generated results (reference data IS tracked)
 validation/results/
 result.txt
+
+# Python virtual environment (only numpy was pre-installed)
+.venv/lib/python3.12/site-packages/contourpy*/
+.venv/lib/python3.12/site-packages/cycler*/
+.venv/lib/python3.12/site-packages/dateutil/
+.venv/lib/python3.12/site-packages/fitz/
+.venv/lib/python3.12/site-packages/fontTools*/
+.venv/lib/python3.12/site-packages/fonttools*/
+.venv/lib/python3.12/site-packages/kiwisolver*/
+.venv/lib/python3.12/site-packages/matplotlib*/
+.venv/lib/python3.12/site-packages/mpl_toolkits/
+.venv/lib/python3.12/site-packages/packaging*/
+.venv/lib/python3.12/site-packages/PIL/
+.venv/lib/python3.12/site-packages/pillow*/
+.venv/lib/python3.12/site-packages/pylab.py
+.venv/lib/python3.12/site-packages/pymupdf*/
+.venv/lib/python3.12/site-packages/pyparsing*/
+.venv/lib/python3.12/site-packages/python_dateutil*/
+.venv/lib/python3.12/site-packages/six*.py
+.venv/lib/python3.12/site-packages/six*-info/
+.venv/bin/fonttools
+.venv/bin/pyftmerge
+.venv/bin/pyftsubset
+.venv/bin/pymupdf
+.venv/bin/ttx
+.venv/share/
