@@ -28,15 +28,15 @@ For the 61×61 grid this is a 3721×3721 5-banded matrix — very fast on A30.
 See the companion script: tissue_armyheart_batch.jl
 """
 
-using DrWatson
-
-# Try to load ArmyHeart from its path if available; otherwise use packages directly
+# Activate ArmyHeart environment if available (provides Thunderbolt, LinearSolve, etc.)
 const ARMYHEART_PATH = get(ENV, "ARMYHEART_PATH", "/tmp/ArmyHeart")
-if isdir(ARMYHEART_PATH)
-    # Use ArmyHeart project environment
+if isdir(joinpath(ARMYHEART_PATH, "Project.toml"))
     import Pkg
     Pkg.activate(ARMYHEART_PATH; io=devnull)
     Pkg.instantiate(; io=devnull)
+    println("Using ArmyHeart environment: $ARMYHEART_PATH")
+else
+    println("Using default Julia environment (Thunderbolt must be installed)")
 end
 
 using Thunderbolt

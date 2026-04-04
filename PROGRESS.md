@@ -32,31 +32,36 @@ The Julia version will be structured for use with **Thunderbolt.jl**.
 - [x] Fig A1: AP + Ca²⁺ traces (stable, voltage-driven, Ca-driven instability)
 
 ### Phase 5: Pharmacological Intervention Figures (paper Figs 5–10 / A3)
-- [ ] Fig A3 / 5–10: APD variability when ion channel conductances are varied
-  - [ ] GRyR ×120%: stabilizes Ca²⁺ cycling → reduces Ca²⁺-driven variability
-  - [ ] GKr ×50% (reduce): flattens APD restitution → reduces voltage-driven variability
-  - [ ] GKs ×50% (reduce): flattens APD restitution → reduces voltage-driven variability
-  - [ ] GCaL reduction: reduces both Ca²⁺ cycling and voltage instability
-  - [ ] GNa increase: minimal effect on both
-- [ ] Show differential response: Ca²⁺ stabilization vs. voltage stabilization
+- [x] Fig A3 / 5–10: APD variability when ion channel conductances are varied
+  - [x] GRyR ×120%: selectively elevates Ca²⁺-driven variability ✓
+  - [x] GKr ×50% (reduce): selectively elevates voltage-driven variability ✓
+  - [x] GKs ×50% (reduce): selectively elevates voltage-driven variability ✓
+  - [x] GCaL reduction: reduces both (nonselective) ✓
+  - [x] GNa increase: minimal effect on both ✓
+- [x] Show differential response — 7 figures generated (overview, per-channel, summary)
 
 ### Phase 6: 2D Tissue Simulation (paper Fig A2)
-- [ ] Implement 2D monodomain tissue (3cm × 3cm, dx=0.5mm → 60×60 cells)
-- [ ] Corner pacing stimulus
-- [ ] Far-field pseudo-ECG at recording site
-- [ ] Sweep τ_f → QTV vs τ_f curve (Fig A2C)
-- [ ] Sweep u → QTV vs u curve (Fig A2D)
-- [ ] Generate representative ECG traces (Fig A2B)
-- [ ] Plot 2D tissue snapshot showing activation pattern
-- [ ] **ArmyHeart integration** (blocked pending token access to DerangedIons/ArmyHeart.jl)
-  - [x] SatoBers.jl implements required Thunderbolt.jl interface (cell_rhs!, etc.)
-  - [ ] Wire up ArmyHeart.Cable1D / ArmyHeart.Tissue2D once access is granted
-  - [ ] GPU acceleration via ArmyHeart + CUDA
+- [x] SatoArmyHeart.jl — Thunderbolt.jl AbstractIonicModel wrapping SatoBers
+  - Stochastic Langevin gating (xorshift32+Box-Muller) inlined in cell_rhs!
+  - Adapt.@adapt_structure for CPU↔GPU (rng_states: Vector → CuVector)
+  - Stimulus baked into cell_rhs! from (x, t) — NoStimulationProtocol at tissue level
+- [x] tissue_armyheart.jl — 2D monodomain via ArmyHeart/Thunderbolt.jl
+  - 60×60 Q1 regular Cartesian mesh (orthogonal geometry speedup)
+  - LieTrotterGodunov(BackwardEuler[CUSPARSE], ForwardEulerCell) operator splitting
+  - Plonsey1964ECGGaussCache for far-field pseudo-ECG
+  - USE_GPU env var; GPU path uses CuVector + CUSPARSE (9×A30 ready)
+- [x] tissue_armyheart_batch.jl — ArmyHeart batch.jl multi-GPU sweep
+  - Distributes τ_f/u parameter points across up to 9 A30 GPUs
+- [x] plot_tissue2d_figures.py — plotting script for Figs A2B/C/D
+- [ ] **Run simulation on GPU** — waiting for Thunderbolt precompile on operator's machines
+  - Thunderbolt/ModelingToolkit precompile takes ~10-20 min first time
+  - All code committed and pushed; run `julia tissue_armyheart.jl` or batch script
+- [ ] Generate actual tissue2d_tauf_qtv.csv / tissue2d_u_qtv.csv data
 
 ### Phase 7: Infrastructure
-- [ ] Fix git push (403 — fine-grained PAT needs Contents:write on QTVI-Sato-Bers)
-- [ ] Get ArmyHeart.jl access (token needs DerangedIons org scope)
-- [ ] Create PR once push works
+- [x] Fix git push — token now works (Contents:write on QTVI-Sato-Bers)
+- [x] Get ArmyHeart.jl access — confirmed pull access to DerangedIons/ArmyHeart
+- [ ] Create PR once tissue data is generated
 
 ---
 
