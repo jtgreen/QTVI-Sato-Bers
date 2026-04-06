@@ -5,7 +5,7 @@ tissue_armyheart.jl — 2D monodomain tissue simulation using ArmyHeart / Thunde
 Reproduces Appendix Fig A2 from Sato et al. (2025):
   - 3 cm × 3 cm, 60×60 Q1 elements (61×61 = 3721 nodes)
   - Corner pacing at x < 1 mm, y < 1 mm
-  - Pseudo-ECG via Thunderbolt's Plonsey1964ECGGaussCache
+  - Pseudo-ECG via Thunderbolt's Plonsey1964ECGGaussCache (Plonsey 1964 far-field)
   - QTVi vs τ_f (Fig A2C) and QTVi vs u (Fig A2D)
   - Stochastic ICaL gating (N_CaL=100,000) → beat-to-beat APD variability
 
@@ -14,25 +14,29 @@ Set SATO_USE_GPU=true.  Each GPU handles one parameter point;
 use tissue_armyheart_batch.jl to distribute the τ_f / u sweep across multiple GPUs.
 
 # Diffusion solver
-BackwardEuler with CUSPARSE CG on GPU — exploits the regular (orthogonal)
-Cartesian mesh structure: the stiffness matrix is the standard discrete
-Laplacian with constant coefficients, assembled once and reused every beat.
+BackwardEulerSolver + CUSPARSE CG on GPU — exploits the regular (orthogonal)
+Cartesian mesh structure: stiffness matrix assembled once, reused every beat.
 For the 61×61 grid this is a 3721×3721 5-banded matrix — very fast on A30.
+AdaptiveForwardEulerSubstepper handles cell ODE (adapts sub-steps during upstroke).
 
 # How to run
   julia tissue_armyheart.jl                        # CPU (default)
   SATO_USE_GPU=true julia tissue_armyheart.jl      # GPU 0
   SATO_USE_GPU=true CUDA_VISIBLE_DEVICES=2 julia tissue_armyheart.jl  # GPU 2
+  ARMYHEART_PATH=/path/to/ArmyHeart julia ...     # use ArmyHeart environment
 
 # How to run the full τ_f sweep across multiple GPUs
 See the companion script: tissue_armyheart_batch.jl
 
-# API notes (verified against Thunderbolt 0.0.1 source)
-  - solution_size(odeform)                      NOT Thunderbolt.OS.function_size
-  - init(prob, alg; dt=...)                     NOT Thunderbolt.OS.init
-  - solve!(integrator)                          NOT Thunderbolt.OS.solve!
-  - TimeChoiceIterator(integ, range)            NOT Thunderbolt.OS.TimeChoiceIterator
-  - GPU system_matrix_type: CuSparseMatrixCSC  NOT CuSparseMatrixCSR
+# API verified against Thunderbolt 0.0.1 + ArmyHeart patterns (ep.jl / benchmarks)
+  - solution_size(odeform)                  → total DOFs
+  - init(prob, alg; dt=...)                 → integrator
+  - solve!(integrator)                      → run to tspan[2]
+  - TimeChoiceIterator(integ, range)        → step-by-step iteration
+  - GPU system_matrix_type: CuSparseMatrixCSR{T,Int32}  (NOT CSC)
+  - Cell stepper: AdaptiveForwardEulerSubstepper (NOT ForwardEulerCellSolver)
+  - ArmyHeart ep.jl uses OS.function_size / OS.init / OS.TimeChoiceIterator;
+    Thunderbolt 0.0.1 standalone exposes these directly in the Thunderbolt module.
 """
 
 # Activate ArmyHeart environment if available (provides Thunderbolt, LinearSolve, etc.)
@@ -51,12 +55,15 @@ import Thunderbolt:
     solution_size,
     ThreadedSparseMatrixCSR,
     SequentialAssemblyStrategy,
+    SequentialCPUDevice,
     BilinearDiffusionIntegrator,
     Plonsey1964ECGGaussCache,
     update_ecg!,
     evaluate_ecg,
     setup_assembled_operator,
-    update_operator!
+    update_operator!,
+    BackwardEulerSolver,
+    AdaptiveForwardEulerSubstepper
 import Thunderbolt.OS: LieTrotterGodunov, OperatorSplittingProblem
 using LinearSolve   # provides KrylovJL_CG
 using Statistics
@@ -84,10 +91,10 @@ const _T = Float64   # Use Float64 throughout (A30 has good FP64)
 
 # Vector type — cpu: Vector{Float64}, gpu: CuVector{Float64}
 _vec_type()    = USE_GPU ? CuVector{_T} : Vector{_T}
-# Matrix type — cpu: ThreadedSparseMatrixCSR, gpu: CuSparseMatrixCSC
-# NOTE: Thunderbolt GPU tests use CuSparseMatrixCSC (not CSR) for backward Euler
+# Matrix type — cpu: ThreadedSparseMatrixCSR, gpu: CuSparseMatrixCSR
+# NOTE: ArmyHeart ep.jl benchmarks use CuSparseMatrixCSR (NOT CSC) on GPU
 _mat_type()    = USE_GPU ?
-    CUDA.CUSPARSE.CuSparseMatrixCSC{_T, Int32} :
+    CUDA.CUSPARSE.CuSparseMatrixCSR{_T, Int32} :
     ThreadedSparseMatrixCSR{_T, Int32}
 _zeros(n::Int) = USE_GPU ? CUDA.zeros(_T, n) : zeros(_T, n)
 
@@ -211,13 +218,25 @@ function run_tissue_sim(;
     electrode  = Vec(_T.((X_ELEC, Y_ELEC)))
     κₜ         = one(_T)   # ratio σᵢ/(4π σₑ) ≈ 1/(4π)
 
-    # ---- Solver: LieTrotterGodunov(BackwardEuler|diffusion, ForwardEuler|cells) ----
+    # ---- Solver: LieTrotterGodunov(BackwardEulerSolver|diffusion, AdaptiveFE|cells) ----
+    # BackwardEulerSolver: implicit diffusion with CUSPARSE CG on GPU
+    # AdaptiveForwardEulerSubstepper: adaptive explicit sub-stepping for stiff cell ODE
+    #   (reaction_threshold=0.1 matches ArmyHeart ep.jl; substeps=10 = max sub-steps)
     ep_stepper = BackwardEulerSolver(;
-        inner_solver         = KrylovJL_CG(),
+        inner_solver         = KrylovJL_CG(;
+            itmax   = 1000,
+            atol    = _T(1e-10),
+            rtol    = _T(1e-10),
+            history = false,
+        ),
         solution_vector_type = _vec_type(),
         system_matrix_type   = _mat_type(),
     )
-    cell_stepper = ForwardEulerCellSolver(; solution_vector_type = _vec_type())
+    cell_stepper = AdaptiveForwardEulerSubstepper(;
+        solution_vector_type = _vec_type(),
+        reaction_threshold   = _T(0.1),
+        substeps             = 10,
+    )
     timestepper  = LieTrotterGodunov((ep_stepper, cell_stepper))
 
     # ---- Pre-pacing (reach steady state) ----
