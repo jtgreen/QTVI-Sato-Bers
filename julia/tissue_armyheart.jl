@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
 """
-tissue_armyheart.jl — 2D monodomain tissue simulation using ArmyHeart
+tissue_armyheart.jl — 2D monodomain tissue simulation using ArmyHeart / Thunderbolt.jl
 
 Reproduces Appendix Fig A2 from Sato et al. (2025):
   - 3 cm × 3 cm, 60×60 Q1 Quadrilateral elements (61×61 = 3721 nodes)
@@ -9,82 +9,80 @@ Reproduces Appendix Fig A2 from Sato et al. (2025):
   - QTVi vs τ_f (Fig A2C) and QTVi vs u (Fig A2D)
   - Stochastic ICaL gating (N_CaL=100,000) → beat-to-beat APD variability
 
-# Architecture (follows ArmyHeart 2D experiment pattern)
-  - Environment: ArmyHeart Project.toml (provides Thunderbolt, CUDA, LinearSolve, etc.)
-  - Mesh: generate_mesh(Quadrilateral, (60,60), ...) — regular Cartesian
-    "Orthogonal geometry" speedup: constant-coeff Laplacian → stiffness assembled once
-  - Model: MonodomainModel + NoStimulationProtocol (stimulus in cell_rhs!)
-  - Splitter: OS.LieTrotterGodunov(BackwardEulerSolver, AdaptiveForwardEulerSubstepper)
+Architecture follows ArmyHeart's with_hetero_standalone.jl exactly:
+  - MonodomainModel + NoStimulationProtocol (stimulus inside cell_rhs!)
+  - OS.LieTrotterGodunov(BackwardEulerSolver, AdaptiveForwardEulerSubstepper)
   - GPU: CuVector{Float32} + CuSparseMatrixCSR{Float32,Int32} (A30 ready)
+  - solution_size(odeform) to size the initial state vector [was OS.function_size in bak/]
 
-# How to run
-  julia tissue_armyheart.jl                                      # CPU
-  SATO_USE_GPU=true julia tissue_armyheart.jl                    # GPU 0
-  SATO_USE_GPU=true CUDA_VISIBLE_DEVICES=2 julia ...             # GPU 2
-  ARMYHEART_PATH=/path/to/ArmyHeart julia tissue_armyheart.jl    # custom AH path
-
-# Batch (multi-GPU τ_f / u sweep)
-  julia tissue_armyheart_batch.jl                                # see that script
+Run modes:
+  julia tissue_armyheart.jl                    # CPU, all defaults
+  SATO_USE_GPU=true julia tissue_armyheart.jl  # GPU 0
+  SATO_USE_GPU=true CUDA_VISIBLE_DEVICES=2 julia tissue_armyheart.jl
+  ARMYHEART_PATH=/path julia tissue_armyheart.jl
 """
 
 # ============================================================================
-# Environment: activate ArmyHeart (provides Thunderbolt, CUDA, LinearSolve…)
+# 0. Environment: activate ArmyHeart project (Thunderbolt, CUDA, LinearSolve, …)
 # ============================================================================
 const ARMYHEART_PATH = get(ENV, "ARMYHEART_PATH", "/tmp/ArmyHeart")
-
 if isdir(joinpath(ARMYHEART_PATH, "Project.toml"))
     import Pkg
     Pkg.activate(ARMYHEART_PATH; io=devnull)
     Pkg.instantiate(; io=devnull)
-    println("✓ ArmyHeart environment: $ARMYHEART_PATH")
+    println("✓ ArmyHeart env: $ARMYHEART_PATH")
 else
-    @warn "ArmyHeart not found at $ARMYHEART_PATH — using default Julia env. " *
-          "Set ARMYHEART_PATH=/path/to/ArmyHeart"
+    @warn "ArmyHeart not found at $ARMYHEART_PATH — using default Julia env"
 end
 
 # ============================================================================
-# Imports — follow ArmyHeart conventions
+# 1. Imports (follow ArmyHeart's with_hetero_standalone.jl)
 # ============================================================================
 using Thunderbolt
-import Thunderbolt.OS               # OrdinaryDiffEqOperatorSplitting
-import Thunderbolt: OS as TbOS      # alias for clarity
-using LinearSolve                   # KrylovJL_CG
+import OrdinaryDiffEqOperatorSplitting as OS   # same as Thunderbolt exports OS
+using LinearSolve
+using LinearAlgebra
 using Statistics
 using Printf
 using Adapt
+using ProgressMeter
 
-# ArmyHeart utility functions (distribute_initial_state!, evaluate_at_grid_nodes)
-const AH_UTILS = joinpath(ARMYHEART_PATH, "src", "utils.jl")
-if isfile(AH_UTILS)
-    include(AH_UTILS)
+# ArmyHeart utility: steady_state_initializer! / distribute_initial_state!
+const _AH_UTILS = joinpath(ARMYHEART_PATH, "src", "utils.jl")
+if isfile(_AH_UTILS)
+    include(_AH_UTILS)
     println("✓ ArmyHeart utils loaded")
 else
-    # Inline the functions we need if ArmyHeart not present
-    function distribute_initial_state!(u₀, y, f)
-        odefun    = f.functions[2]
+    # Fallback inline implementation
+    function steady_state_initializer!(u₀, f::GenericSplitFunction)
+        odefun      = f.functions[2]
         ionic_model = odefun.ode
-        ionic_dofrange = f.solution_indices[2]
-        dh = f.functions[1].dh
-        s₀flat = @view u₀[ionic_dofrange]
-        s₀ = reshape(s₀flat, (Thunderbolt.Ferrite.ndofs(dh), Thunderbolt.num_states(ionic_model)))
+        dh          = f.functions[1].dh
+        s₀flat      = @view u₀[f.solution_indices[2]]
+        s₀          = reshape(s₀flat, (ndofs(dh), Thunderbolt.num_states(ionic_model)))
+        default_values = Thunderbolt.default_initial_state(ionic_model, nothing)
+        for i in 1:Thunderbolt.num_states(ionic_model)
+            s₀[:, i] .= default_values[i]
+        end
+    end
+    function distribute_initial_state!(u₀, y, f::GenericSplitFunction)
+        odefun      = f.functions[2]
+        ionic_model = odefun.ode
+        dh          = f.functions[1].dh
+        s₀flat      = @view u₀[f.solution_indices[2]]
+        s₀          = reshape(s₀flat, (ndofs(dh), Thunderbolt.num_states(ionic_model)))
         for i in 1:Thunderbolt.num_states(ionic_model)
             s₀[:, i] .= y[i]
         end
     end
-    function steady_state_initializer!(u₀, f)
-        odefun    = f.functions[2]
-        ionic_model = odefun.ode
-        default_values = Thunderbolt.default_initial_state(ionic_model, nothing)
-        distribute_initial_state!(u₀, default_values, f)
-    end
-    println("⚠ ArmyHeart utils not found — using inline fallbacks")
+    println("⚠ ArmyHeart utils fallback")
 end
 
-# Our Sato-Bers ArmyHeart model (follows LuoRudy.jl pattern)
+# Our Sato-Bers ArmyHeart ionic model
 include(joinpath(@__DIR__, "SatoArmyHeart.jl"))
 
 # ============================================================================
-# GPU / CPU toggle
+# 2. GPU / CPU setup (mirrors ArmyHeart 2D standalone)
 # ============================================================================
 const USE_GPU = parse(Bool, get(ENV, "SATO_USE_GPU", "false"))
 
@@ -93,74 +91,71 @@ if USE_GPU
     @info "GPU mode: $(CUDA.name(CUDA.device()))"
 end
 
-# Use Float32 on GPU (A30 FP32 is 10× faster than FP64), Float64 on CPU
+# Float32 on GPU (A30 FP32 ≈ 10× FP64), Float64 on CPU
 const _T = USE_GPU ? Float32 : Float64
 
-# Vector / matrix types
-_SolutionVectorType() = USE_GPU ? CuVector{_T}                          : Vector{_T}
-_SystemMatrixType()   = USE_GPU ? CUDA.CUSPARSE.CuSparseMatrixCSR{_T, Int32} :
-                                  Thunderbolt.ThreadedSparseMatrixCSR{_T, Int32}
+# Types (following with_hetero_standalone.jl style)
+const SolutionVectorType = USE_GPU ? CuVector{_T}                              : Vector{_T}
+const SystemMatrixType   = USE_GPU ? CUDA.CUSPARSE.CuSparseMatrixCSR{_T,Int32} :
+                                     ThreadedSparseMatrixCSR{_T,Int32}
 
 # ============================================================================
-# Tissue parameters (Sato et al. 2025, Appendix Fig A2)
+# 3. Tissue parameters (Sato et al. 2025, Appendix Fig A2)
 # ============================================================================
-const L_MM   = 30.0          # Tissue side length (mm) = 3 cm
-const N_EL   = 60            # Elements per side  → 60×60 Q1 elements
-const DX_MM  = L_MM / N_EL  # = 0.5 mm node spacing
-const N_NX   = N_EL + 1      # = 61 nodes in x
-const N_NY   = N_EL + 1      # = 61 nodes in y
+const L_MM      = 30.0          # tissue side length (mm) = 3 cm
+const N_EL      = 60            # elements per side → 60×60 Q1 grid
+const DX_MM     = L_MM / N_EL  # = 0.5 mm element size
+const N_NX      = N_EL + 1      # = 61 nodes in x
+const N_NY      = N_EL + 1      # = 61 nodes in y
+const KAPPA     = 0.1           # isotropic conductivity D (mm²/ms)
+const BCL       = 300.0         # basic cycle length (ms)
+const DT₀       = 0.01          # timestep (ms) — "no touchy" per ArmyHeart
+const DT_VIS    = 10.0          # ECG sample interval (ms)
+const STIM_AMP  = 80.0          # stimulus amplitude (µA/µF)
+const STIM_DUR  = 1.0           # stimulus duration (ms)
+const CORNER_MM = DX_MM * 2     # pacing region: x,y < 1 mm
 
-# Isotropic conductivity κ = D = 0.1 mm²/ms
-# χ = Cₘ = 1 (dimensionless normalisation used by Sato 2025)
-const KAPPA  = _T(0.1)
-
-# Far-field ECG electrode: corner diagonally opposite the pacing site
-const X_ELEC = _T(L_MM + 2.5)
-const Y_ELEC = _T(L_MM + 2.5)
-
-# Simulation timing
-const BCL       = 300.0   # ms  basic cycle length
-const DT₀       = 0.01    # ms  time step (ArmyHeart default — "no touchy")
-const STIM_AMP  = 80.0    # µA/µF
-const STIM_DUR  = 1.0     # ms
-const CORNER_MM = DX_MM * 2  # pacing region: x,y < 1 mm
+# ECG electrode position (outside tissue, opposite corner from pacing site)
+const X_ELEC = L_MM + 5.0   # mm
+const Y_ELEC = L_MM + 5.0   # mm
 
 # ============================================================================
-# Build mesh + model (shared across all parameter points)
+# 4. Build mesh + ODE form (semidiscrete monodomain system)
 # ============================================================================
 
 """
-    build_odeform(ionic) → odeform
+    build_odeform(ionic) → GenericSplitFunction
 
-Assemble the semidiscrete monodomain ODE system for one parameter point.
-Mesh is 60×60 Q1 Cartesian grid — constant-coefficient Laplacian.
+60×60 Q1 Cartesian monodomain mesh.
+Orthogonal-geometry speedup: constant-coefficient Laplacian → assembled once.
+Follows ArmyHeart's with_hetero_standalone.jl structure.
 """
 function build_odeform(ionic)
-    T = _T
+    T   = _T
+    L   = T(L_MM)
+    nel = N_EL
 
-    # -- 60×60 Q1 (Quadrilateral) mesh — "orthogonal geometry" Cartesian grid
+    # Quadrilateral (linear Q1) mesh — 60×60 elements, 61×61 nodes
     ep_mesh = generate_mesh(
-        Quadrilateral,
-        (N_EL, N_EL),
-        Thunderbolt.Vec(T.((0.0, 0.0))),
-        Thunderbolt.Vec(T.((L_MM, L_MM))),
+        Quadrilateral, (nel, nel),
+        Vec(T.((0.0, 0.0))),
+        Vec(T.((L, L))),
     )
     ep_cs = CartesianCoordinateSystem(ep_mesh)
 
-    # Isotropic conductivity tensor κI (2×2 symmetric)
+    # Isotropic conductivity κ (2×2 symmetric tensor)
     κ_tensor = ConstantCoefficient(
-        SymmetricTensor{2, 2, T}((KAPPA, zero(T), KAPPA))
+        SymmetricTensor{2, 2, T}((T(KAPPA), zero(T), T(KAPPA)))
     )
 
-    # MonodomainModel: χ=1, Cₘ=1, κ, NoStim (stimulus inside cell_rhs!)
+    # MonodomainModel: χ=1, Cₘ=1, κ, NoStim (stimulus lives in cell_rhs!)
     model = MonodomainModel(
         ConstantCoefficient(one(T)),
         ConstantCoefficient(one(T)),
         κ_tensor,
         NoStimulationProtocol(),
         ionic,
-        :φₘ,
-        :s,
+        :φₘ, :s,
     )
 
     # Semidiscretize with Q1 Lagrange elements
@@ -169,34 +164,35 @@ function build_odeform(ionic)
         FiniteElementDiscretization(Dict(:φₘ => LagrangeCollection{1}())),
         ep_mesh,
     )
-
     return odeform
 end
 
-"""
-    build_solver() → timestepper
+# ============================================================================
+# 5. Solver (LieTrotterGodunov — ArmyHeart 2D standard)
+# ============================================================================
 
-BackwardEulerSolver (implicit diffusion) + AdaptiveForwardEulerSubstepper (cell ODEs)
-wrapped in LieTrotterGodunov splitting — exact ArmyHeart 2D pattern.
+"""
+    build_solver() → OS.LieTrotterGodunov
+
+BackwardEulerSolver (implicit diffusion) + AdaptiveForwardEulerSubstepper (ionic ODE)
+wrapped in Lie-Trotter-Godunov operator splitting.
 """
 function build_solver()
-    T = _T
-    SolutionVectorType = _SolutionVectorType()
-    SystemMatrixType   = _SystemMatrixType()
+    T   = _T
 
     ep_stepper = BackwardEulerSolver(;
-        inner_solver = LinearSolve.KrylovJL_CG(;
+        inner_solver = KrylovJL_CG(;
             itmax   = 1000,
             atol    = T(1e-10),
             rtol    = T(1e-10),
             history = false,
         ),
-        solution_vector_type = typeof(SolutionVectorType),
-        system_matrix_type   = typeof(SystemMatrixType),
+        solution_vector_type = SolutionVectorType,
+        system_matrix_type   = SystemMatrixType,
     )
 
     cell_stepper = AdaptiveForwardEulerSubstepper(;
-        solution_vector_type = typeof(SolutionVectorType),
+        solution_vector_type = SolutionVectorType,
         reaction_threshold   = T(0.1),
         substeps             = 10,
     )
@@ -205,47 +201,45 @@ function build_solver()
 end
 
 # ============================================================================
-# ECG setup (Plonsey 1964 far-field, via Thunderbolt)
+# 6. Plonsey1964 pseudo-ECG setup
 # ============================================================================
 
 """
-    build_ecg_cache(odeform) → (cache, dh_for_ecg)
+    build_ecg_cache(odeform) → (Plonsey1964ECGGaussCache, n_nodes)
 
-Set up Plonsey1964ECGGaussCache for the tissue mesh.
-The diffusion operator is assembled on CPU (even in GPU runs).
+Assemble diffusion operator on CPU for the far-field ECG integral.
+Uses Float64 for numerical accuracy regardless of GPU/CPU mode.
 """
-function build_ecg_cache(odeform)
-    T = Float64   # ECG always double-precision on CPU
+function build_ecg_cache(odeform::GenericSplitFunction)
+    dh   = odeform.functions[1].dh
+    n    = ndofs(dh)
 
-    dh = odeform.functions[1].dh
-    n_nodes = Thunderbolt.Ferrite.ndofs(dh)
-
-    κ_coeff_cpu = ConstantCoefficient(SymmetricTensor{2, 2, T}((_T(KAPPA), zero(T), _T(KAPPA))))
-
-    # CPU-side assembled diffusion operator (stiffness matrix for Plonsey formula)
-    cpu_strategy = SequentialAssemblyStrategy(SequentialCPUDevice())
-    diff_op = setup_assembled_operator(
-        cpu_strategy,
-        BilinearDiffusionIntegrator(κ_coeff_cpu, QuadratureRuleCollection(2), :φₘ),
-        Thunderbolt.ThreadedSparseMatrixCSR{T, Int32},
+    κ_cpu = ConstantCoefficient(
+        SymmetricTensor{2, 2, Float64}((KAPPA, 0.0, KAPPA))
+    )
+    strategy = SequentialAssemblyStrategy(SequentialCPUDevice())
+    diff_op  = setup_assembled_operator(
+        strategy,
+        BilinearDiffusionIntegrator(κ_cpu, QuadratureRuleCollection(2), :φₘ),
+        ThreadedSparseMatrixCSR{Float64, Int32},
         dh,
     )
     update_operator!(diff_op, 0.0)
 
-    φ₀ = zeros(T, n_nodes)
+    φ₀        = zeros(Float64, n)
     ecg_cache = Plonsey1964ECGGaussCache(diff_op, φ₀)
-    return ecg_cache, n_nodes
+    return ecg_cache, n
 end
 
 # ============================================================================
-# Main simulation runner
+# 7. Main simulation runner
 # ============================================================================
 
 """
-    run_tissue_sim(; tauf, av, N_CaL, ...) → (qt_intervals, ecg_trace)
+    run_tissue_sim(; tauf, av, N_CaL, ...) → (qt_intervals, ecg_t, ecg_v)
 
 Run the 2D monodomain tissue simulation for one (τ_f, u) parameter point.
-Returns beat-to-beat QT intervals (ms) and the full ECG trace.
+Returns beat-to-beat QT intervals (ms) and the ECG time/voltage trace.
 """
 function run_tissue_sim(;
     tauf          :: Float64 = 52.0,
@@ -263,93 +257,81 @@ function run_tissue_sim(;
     verbose && @printf("\n══ τ_f=%.1f  u=%.2f  N_CaL=%d  GPU=%s ══\n",
                        tauf, av, N_CaL, USE_GPU)
 
-    # -- Ionic model (Sato-Bers, follows ArmyHeart LuoRudy.jl pattern) --
+    # -- 7a. Ionic model (SatoBersArmyModel) --
     ionic_cpu = SatoBersArmyModel(;
-        tauf      = tauf,
-        av        = av,
-        N_CaL     = N_CaL,
-        gna       = gna,
-        gkr       = gkr,
-        gks       = gks,
-        g_rel     = g_rel,
-        nx        = N_NX,
-        ny        = N_NY,
-        dx        = DX_MM,
-        dy        = DX_MM,
-        dt        = DT₀,
-        bcl       = BCL,
-        stim_amp  = STIM_AMP,
-        stim_dur  = STIM_DUR,
-        corner_mm = CORNER_MM,
+        tauf      = tauf,  av        = av,
+        N_CaL     = N_CaL, gna       = gna,
+        gkr       = gkr,   gks       = gks,
+        g_rel     = g_rel, nx        = N_NX,
+        ny        = N_NY,  dx        = DX_MM,
+        dy        = DX_MM, dt        = DT₀,
+        bcl       = BCL,   stim_amp  = STIM_AMP,
+        stim_dur  = STIM_DUR, corner_mm = CORNER_MM,
     )
     ionic = USE_GPU ? Adapt.adapt(CUDA.cu, ionic_cpu) : ionic_cpu
 
-    # -- Build semidiscrete form --
+    # -- 7b. Semidiscrete monodomain ODE system --
     odeform = build_odeform(ionic)
-
-    # -- Initial state: fill all nodes with default resting state --
-    n_total = OS.function_size(odeform)
-    u₀_cpu = zeros(T, n_total)
-    steady_state_initializer!(u₀_cpu, odeform)
-    u₀ = USE_GPU ? _SolutionVectorType()(u₀_cpu) : u₀_cpu
-
-    # -- ECG cache (CPU side, double precision) --
-    ecg_cache, n_nodes = build_ecg_cache(odeform)
-    electrode = Thunderbolt.Vec(Float64.((X_ELEC, Y_ELEC)))
-    κₜ        = 1.0   # ratio σᵢ / (4π σₑ) normalised to 1
-
-    # -- Solver: LieTrotterGodunov(BackwardEuler, AdaptiveFE) --
     timestepper = build_solver()
 
-    # ── Pre-pacing: run prepace_beats × BCL ms to reach limit cycle ──
-    verbose && @printf("  Pre-pacing %d beats (%.0f ms)…\n",
-                       prepace_beats, prepace_beats * BCL)
-    t0_pre = time()
-    pre_prob  = OS.OperatorSplittingProblem(
-        odeform, copy(u₀), (T(0), T(prepace_beats * BCL))
-    )
-    pre_integ = OS.init(pre_prob, timestepper; dt=T(DT₀), verbose=false)
-    # Advance quietly (no output collection needed)
-    @showprogress for (_, _) in OS.TimeChoiceIterator(
-            pre_integ, T(0) : T(BCL) : T((prepace_beats-1)*BCL))
-    end
-    u_ss = copy(pre_integ.u)
-    verbose && @printf("  Pre-pacing done in %.1f s\n", time() - t0_pre)
+    # -- 7c. Initial condition: resting state at all nodes --
+    n_total = solution_size(odeform)              # ← correct API (not OS.function_size)
+    u₀_cpu  = zeros(_T, n_total)
+    steady_state_initializer!(u₀_cpu, odeform)
+    u₀ = USE_GPU ? SolutionVectorType(u₀_cpu) : u₀_cpu
 
-    # ── Measurement phase: meas_beats × BCL ms, collect ECG ──
-    verbose && @printf("  Measuring %d beats (%.0f ms)…\n",
-                       meas_beats, meas_beats * BCL)
-    t0_meas = time()
-    meas_prob  = OS.OperatorSplittingProblem(
-        odeform, u_ss, (T(0), T(meas_beats * BCL))
-    )
+    # -- 7d. ECG cache (always CPU / Float64 for accuracy) --
+    ecg_cache, n_nodes = build_ecg_cache(odeform)
+    electrode = Vec{2, Float64}((X_ELEC, Y_ELEC))
+    κₜ        = 1.0   # normalised torso conductivity
+
+    # -- 7e. Pre-pacing: prepace_beats × BCL ms to reach limit cycle --
+    verbose && @printf("  Pre-pacing %d beats…\n", prepace_beats)
+    t0 = time()
+    pre_tspan = (T(0), T(prepace_beats * BCL))
+    pre_prob  = OS.OperatorSplittingProblem(odeform, copy(u₀), pre_tspan)
+    pre_integ = OS.init(pre_prob, timestepper; dt=T(DT₀), verbose=false)
+
+    pre_trange = T(0) : T(BCL) : T((prepace_beats - 1) * BCL)
+    @showprogress for (_, _) in OS.TimeChoiceIterator(pre_integ, pre_trange) end
+    u_ss = copy(pre_integ.u)
+    verbose && @printf("  Pre-pacing done in %.1f s\n", time() - t0)
+
+    # -- 7f. Measurement phase: meas_beats × BCL ms, sample ECG every DT_VIS ms --
+    verbose && @printf("  Measuring %d beats (ECG sample every %.0f ms)…\n",
+                       meas_beats, DT_VIS)
+    t0 = time()
+
+    meas_tspan = (T(0), T(meas_beats * BCL))
+    meas_prob  = OS.OperatorSplittingProblem(odeform, u_ss, meas_tspan)
     meas_integ = OS.init(meas_prob, timestepper; dt=T(DT₀), verbose=false)
 
     heat_dofrange = odeform.solution_indices[1]   # φₘ DOF indices
 
-    n_steps   = round(Int, meas_beats * BCL / DT₀)
-    ecg_trace = zeros(Float64, n_steps)
-    step_idx  = 0
+    meas_trange = T(0) : T(DT_VIS) : T(meas_beats * BCL - DT_VIS)
+    n_steps = length(meas_trange)
+    ecg_t   = Float64.(collect(meas_trange))
+    ecg_v   = zeros(Float64, n_steps)
+    idx     = 0
 
-    for (u_, _) in OS.TimeChoiceIterator(
-            meas_integ,
-            T(0) : T(DT₀) : T(meas_beats * BCL - DT₀))
-        step_idx += 1
-        step_idx > n_steps && break
+    @showprogress for (u_, _) in OS.TimeChoiceIterator(meas_integ, meas_trange)
+        idx += 1
+        idx > n_steps && break
 
-        # Extract φₘ on CPU (float64 for ECG accuracy)
+        # Copy φₘ to CPU as Float64 for ECG calculation
         φ_cpu = Float64.(Vector(u_[heat_dofrange]))
         update_ecg!(ecg_cache, φ_cpu)
-        ecg_trace[step_idx] = evaluate_ecg(ecg_cache, electrode, κₜ)
+        ecg_v[idx] = evaluate_ecg(ecg_cache, electrode, κₜ)
     end
-    verbose && @printf("  Measurement done in %.1f s\n", time() - t0_meas)
+    verbose && @printf("  Measurement done in %.1f s\n", time() - t0)
 
-    # ── QT detection + QTVi ──
-    qt_intervals = detect_qt_intervals(ecg_trace, meas_beats; dt=DT₀)
+    # -- 7g. QT interval detection + QTVi --
+    qt_intervals = detect_qt_intervals(ecg_v, meas_beats; dt=DT_VIS)
     if verbose
         n = length(qt_intervals)
         if n >= 5
-            μ = mean(qt_intervals); σ = std(qt_intervals)
+            μ    = mean(qt_intervals)
+            σ    = std(qt_intervals)
             qtvi = compute_qtvi(qt_intervals)
             @printf("  QT = %.2f ± %.3f ms  QTVi = %.4f  (n=%d)\n", μ, σ, qtvi, n)
         else
@@ -357,39 +339,48 @@ function run_tissue_sim(;
         end
     end
 
-    return qt_intervals, ecg_trace
+    return qt_intervals, ecg_t, ecg_v
 end
 
 # ============================================================================
-# QT interval detection (Tangent method on the pseudo-ECG)
+# 8. QT interval detection (tangent method on pseudo-ECG)
 # ============================================================================
 
+"""
+    detect_qt_intervals(ecg, n_beats; dt) → Vector{Float64}
+
+Detect QT intervals from pseudo-ECG trace using tangent method.
+Each beat window is BCL/dt samples long.
+"""
 function detect_qt_intervals(
-    ecg :: Vector{Float64},
+    ecg    :: Vector{Float64},
     n_beats :: Int;
-    dt  :: Float64 = DT₀,
+    dt     :: Float64 = DT_VIS,
 )
     QTs  = Float64[]
     step = round(Int, BCL / dt)
     for b in 0:(n_beats - 1)
-        i0 = b*step + 1
-        i1 = min((b+1)*step, length(ecg))
-        i1 - i0 < 50 && continue
+        i0 = b * step + 1
+        i1 = min((b + 1) * step, length(ecg))
+        i1 - i0 < 20 && continue
 
         beat = ecg[i0:i1]
         n    = length(beat)
-        w    = max(1, round(Int, 0.03n))
-        bl   = 0.5 * (mean(beat[1:w]) + mean(beat[end-w+1:end]))
+        w    = max(1, round(Int, 0.05n))
 
-        # Q onset
+        # Baseline
+        bl = 0.5 * (mean(beat[1:w]) + mean(beat[end-w+1:end]))
+
+        # Q onset: first crossing of 20% of QRS peak above baseline
         qe   = round(Int, 0.40n)
+        qe < 2 && continue
         qd   = abs.(beat[1:qe] .- bl)
         isempty(qd) && continue
-        qp   = argmax(qd)
-        qs   = sign(beat[qp] - bl)
-        qt   = bl + 0.20 * qs * qd[qp]
+        qpk  = argmax(qd)
+        qs   = sign(beat[qpk] - bl)
+        qt   = bl + 0.20 * qs * qd[qpk]
         qi   = 1
-        for i in 1:qp
+        for i in 1:qpk
             if (qs > 0 ? beat[i] > qt : beat[i] < qt)
                 qi = i; break
             end
@@ -399,44 +390,51 @@ function detect_qt_intervals(
         ts  = round(Int, 0.35n)
         te0 = round(Int, 0.95n)
         ts >= te0 && continue
-        td  = abs.(beat[ts:te0] .- bl)
-        tp  = argmax(td) + ts - 1
+        tseg = beat[ts:te0]
+        isempty(tseg) && continue
+        td   = abs.(tseg .- bl)
+        tp   = argmax(td) + ts - 1
         tsgn = sign(beat[tp] - bl)
         tpk  = td[argmax(td)]
         tt   = bl + 0.05 * tsgn * tpk
         tei  = te0
         for i in te0:-1:tp
+            i > length(beat) && continue
             if (tsgn > 0 ? beat[i] > tt : beat[i] < tt)
                 tei = i; break
             end
         end
 
         qt_ms = (tei - qi) * dt
-        50.0 < qt_ms < 400.0 && push!(QTs, qt_ms)
+        50.0 < qt_ms < 450.0 && push!(QTs, qt_ms)
     end
     return QTs
 end
 
+"""
+    compute_qtvi(qts) → Float64
+
+QT variability index: log10(Var(QT)/Mean(QT)²) - log10(RR variance floor).
+"""
 function compute_qtvi(qts :: Vector{Float64})
     length(qts) < 5 && return NaN
-    μ  = mean(qts)
-    σ² = max(var(qts), 1e-8)
-    # Floor RR variance to avoid -Inf when BCL is constant
-    rr_var_floor = 1e-6 / BCL^2
+    μ   = mean(qts)
+    σ²  = max(var(qts), 1e-8)
+    rr_var_floor = (1e-3 / BCL)^2  # ~constant pacing
     return log10(σ² / μ^2) - log10(rr_var_floor)
 end
 
 # ============================================================================
-# Main: τ_f sweep + u sweep → write CSVs (Fig A2C, A2D)
+# 9. Main: τ_f sweep + u sweep → write CSVs (Fig A2C, A2D)
 # ============================================================================
 
 function main()
     println("="^72)
     println("2D Monodomain Tissue — ArmyHeart / Thunderbolt.jl")
-    println("  Mesh:     $(N_EL)×$(N_EL) Q1 quads  ($(N_NX)×$(N_NY) nodes)")
-    println("  GPU:      $USE_GPU   (precision: $_T)")
-    println("  κ:        $(KAPPA) mm²/ms   dt₀=$(DT₀) ms   BCL=$(BCL) ms")
-    println("  Electrode: ($(X_ELEC), $(Y_ELEC)) mm")
+    println("  Mesh:  $(N_EL)×$(N_EL) Q1 quads  →  $(N_NX)×$(N_NY) nodes")
+    println("  GPU:   $USE_GPU   (precision: $_T)")
+    println("  κ:     $KAPPA mm²/ms   dt₀=$DT₀ ms   BCL=$BCL ms")
+    println("  ECG electrode: ($X_ELEC, $Y_ELEC) mm")
     println("="^72)
 
     out = joinpath(@__DIR__, "..", "figures", "data")
@@ -444,7 +442,7 @@ function main()
 
     prepace = 20
     meas    = 60
-    ecg_saved = Dict{String, Vector{Float64}}()
+    ecg_saved = Dict{String, Tuple{Vector{Float64},Vector{Float64}}}()
 
     # ── τ_f sweep (Fig A2C) ──────────────────────────────────────────────────
     println("\n=== τ_f sweep → QTVi (Fig A2C) ===")
@@ -452,18 +450,19 @@ function main()
     open(joinpath(out, "tissue2d_tauf_qtv.csv"), "w") do io
         println(io, "tauf,qt_mean,qt_std,qtvi,n_beats")
         for tf in tauf_vals
-            qts, ecg = run_tissue_sim(;
+            qts, et, ev = run_tissue_sim(;
                 tauf=tf, av=3.0, N_CaL=100_000,
                 prepace_beats=prepace, meas_beats=meas,
             )
-            if length(qts) < 5
-                println(io, "$tf,NaN,NaN,NaN,$(length(qts))")
+            n = length(qts)
+            if n < 5
+                println(io, "$tf,NaN,NaN,NaN,$n")
             else
-                μ = mean(qts); σ = std(qts); qtvi = compute_qtvi(qts)
-                println(io, "$tf,$μ,$σ,$qtvi,$(length(qts))")
+                μ    = mean(qts); σ = std(qts); qtvi = compute_qtvi(qts)
+                println(io, "$tf,$μ,$σ,$qtvi,$n")
             end
             flush(io)
-            tf in [30.0, 45.0, 52.0] && (ecg_saved["tauf$(round(Int,tf))"] = ecg)
+            tf in [30.0, 45.0, 52.0] && (ecg_saved["tauf$(round(Int,tf))"] = (et, ev))
         end
     end
     println("  → tissue2d_tauf_qtv.csv written")
@@ -474,18 +473,19 @@ function main()
     open(joinpath(out, "tissue2d_u_qtv.csv"), "w") do io
         println(io, "u,qt_mean,qt_std,qtvi,n_beats")
         for uv in u_vals
-            qts, ecg = run_tissue_sim(;
+            qts, et, ev = run_tissue_sim(;
                 tauf=35.0, av=uv, N_CaL=100_000,
                 prepace_beats=prepace, meas_beats=meas,
             )
-            if length(qts) < 5
-                println(io, "$uv,NaN,NaN,NaN,$(length(qts))")
+            n = length(qts)
+            if n < 5
+                println(io, "$uv,NaN,NaN,NaN,$n")
             else
-                μ = mean(qts); σ = std(qts); qtvi = compute_qtvi(qts)
-                println(io, "$uv,$μ,$σ,$qtvi,$(length(qts))")
+                μ    = mean(qts); σ = std(qts); qtvi = compute_qtvi(qts)
+                println(io, "$uv,$μ,$σ,$qtvi,$n")
             end
             flush(io)
-            uv in [5.0, 8.0, 9.5] && (ecg_saved["u$(uv)"] = ecg)
+            uv in [5.0, 8.0, 9.5] && (ecg_saved["u$(uv)"] = (et, ev))
         end
     end
     println("  → tissue2d_u_qtv.csv written")
@@ -495,21 +495,21 @@ function main()
         ks = sort(collect(keys(ecg_saved)))
         open(joinpath(out, "tissue2d_ecg_traces.csv"), "w") do io
             println(io, "t_ms," * join(ks, ","))
-            n = minimum(length(v) for v in values(ecg_saved))
+            n = minimum(length(v[1]) for v in values(ecg_saved))
             for i in 1:n
-                t_str = string(round((i-1)*DT₀, digits=3))
-                vals  = join([string(ecg_saved[k][i]) for k in ks], ",")
+                t_str = string(round(ecg_saved[ks[1]][1][i], digits=2))
+                vals  = join([string(round(ecg_saved[k][2][i], digits=8)) for k in ks], ",")
                 println(io, "$t_str,$vals")
             end
         end
         println("  → tissue2d_ecg_traces.csv written")
     end
 
-    println("\n✓ 2D tissue simulation complete.")
+    println("\n✓ 2D tissue simulation complete — see figures/data/tissue2d_*.csv")
     return nothing
 end
 
-# Only run main() when executed directly (not when included from batch script)
+# ── Entry point ──
 if abspath(PROGRAM_FILE) == @__FILE__
     main()
 end
