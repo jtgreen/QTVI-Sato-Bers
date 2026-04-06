@@ -10,9 +10,8 @@ Reproduces Appendix Fig A2 from Sato et al. (2025):
   - Stochastic ICaL gating (N_CaL=100,000) → beat-to-beat APD variability
 
 # GPU path (9 × A30)
-Set USE_GPU=true and call device!(gpu_id) before running.
-Each GPU handles one parameter point; use ArmyHeart's batch.jl to
-distribute the τ_f / u sweep across multiple GPUs.
+Set SATO_USE_GPU=true.  Each GPU handles one parameter point;
+use tissue_armyheart_batch.jl to distribute the τ_f / u sweep across multiple GPUs.
 
 # Diffusion solver
 BackwardEuler with CUSPARSE CG on GPU — exploits the regular (orthogonal)
@@ -21,11 +20,19 @@ Laplacian with constant coefficients, assembled once and reused every beat.
 For the 61×61 grid this is a 3721×3721 5-banded matrix — very fast on A30.
 
 # How to run
-  julia tissue_armyheart.jl                 # CPU (default, USE_GPU=false)
-  julia -e 'using CUDA; device!(0)' tissue_armyheart.jl   # GPU 0
+  julia tissue_armyheart.jl                        # CPU (default)
+  SATO_USE_GPU=true julia tissue_armyheart.jl      # GPU 0
+  SATO_USE_GPU=true CUDA_VISIBLE_DEVICES=2 julia tissue_armyheart.jl  # GPU 2
 
-# How to run the full τ_f sweep across multiple GPUs (using ArmyHeart batch.jl)
+# How to run the full τ_f sweep across multiple GPUs
 See the companion script: tissue_armyheart_batch.jl
+
+# API notes (verified against Thunderbolt 0.0.1 source)
+  - solution_size(odeform)                      NOT Thunderbolt.OS.function_size
+  - init(prob, alg; dt=...)                     NOT Thunderbolt.OS.init
+  - solve!(integrator)                          NOT Thunderbolt.OS.solve!
+  - TimeChoiceIterator(integ, range)            NOT Thunderbolt.OS.TimeChoiceIterator
+  - GPU system_matrix_type: CuSparseMatrixCSC  NOT CuSparseMatrixCSR
 """
 
 # Activate ArmyHeart environment if available (provides Thunderbolt, LinearSolve, etc.)
@@ -40,7 +47,7 @@ else
 end
 
 using Thunderbolt
-import Thunderbolt: OrderedSet
+import Thunderbolt: solution_size, ThreadedSparseMatrixCSR
 using LinearSolve
 using Statistics
 using Printf
@@ -59,10 +66,14 @@ end
 
 const _T = Float64   # Use Float64 throughout (A30 has good FP64)
 
-_vec_type() = USE_GPU ? CuVector{_T} : Vector{_T}
-_mat_type() = USE_GPU ?
-    CUDA.CUSPARSE.CuSparseMatrixCSR{_T, Int32} :
-    Thunderbolt.ThreadedSparseMatrixCSR{_T, Int32}
+# Vector type — cpu: Vector{Float64}, gpu: CuVector{Float64}
+_vec_type()    = USE_GPU ? CuVector{_T} : Vector{_T}
+# Matrix type — cpu: ThreadedSparseMatrixCSR, gpu: CuSparseMatrixCSC
+# NOTE: Thunderbolt GPU tests use CuSparseMatrixCSC (not CSR) for backward Euler
+_mat_type()    = USE_GPU ?
+    CUDA.CUSPARSE.CuSparseMatrixCSC{_T, Int32} :
+    ThreadedSparseMatrixCSR{_T, Int32}
+_zeros(n::Int) = USE_GPU ? CUDA.zeros(_T, n) : zeros(_T, n)
 
 # ============================================================================
 # Tissue parameters  (match Sato et al. 2025, Appendix Fig A2)
@@ -85,7 +96,7 @@ const BCL      = 300.0   # ms
 const DT₀      = 0.05    # ms  (explicit step for cell solver)
 const STIM_AMP = 80.0    # µA/µF
 const STIM_DUR = 1.0     # ms
-const CORNER   = DX * 2  # pacing region x,y < 1 mm (2-element wide corner)
+const CORNER   = DX * 2  # pacing region: x,y < 1 mm (2-element wide corner)
 
 # ============================================================================
 # Build one tissue simulation, run it, return QT intervals + ECG
@@ -114,8 +125,8 @@ function run_tissue_sim(;
     ionic_dev = USE_GPU ? Adapt.adapt(CUDA.cu, ionic) : ionic
 
     # ---- Mesh: 60×60 regular Q1 (Quadrilateral) grid ----
-    # This is the "orthogonal geometry" — constant-coefficient Laplacian,
-    # assembled once, very efficient on GPU (5-band structured matrix).
+    # "Orthogonal geometry" speedup: regular Cartesian mesh → constant-coefficient
+    # Laplacian → stiffness matrix assembled once, reused every beat.
     ep_mesh = generate_mesh(
         Quadrilateral,
         (N_EL, N_EL),
@@ -131,7 +142,7 @@ function run_tissue_sim(;
         ConstantCoefficient(one(_T)),  # χ = 1
         ConstantCoefficient(one(_T)),  # Cₘ = 1
         κ_coeff,
-        NoStimulationProtocol(),       # stimulus handled in cell_rhs!
+        NoStimulationProtocol(),       # stimulus handled inside cell_rhs!(x, t)
         ionic_dev,
         :φₘ,
         :s,
@@ -145,76 +156,82 @@ function run_tissue_sim(;
     )
 
     # ---- Initial state ----
-    u0_size = Thunderbolt.OS.function_size(odeform)
-    u₀ = zeros(_T, u0_size)
-    # Populate ionic state DOFs with default resting values
-    heat_dofrange  = odeform.solution_indices[1]
-    ionic_dofrange = odeform.solution_indices[2]
-    ionic_model_inner = odeform.functions[2].ode   # extract ionic model from ODE function
-    u0_cell = Thunderbolt.default_initial_state(ionic_model_inner, nothing)
-    n_dofs  = length(heat_dofrange)
+    # solution_size returns total unique DOFs = n_states_per_cell * n_nodes
+    # Layout: u[1:n_nodes] = φₘ  (overlaps with state 1 of cell model)
+    #         u[1:n_states*n_nodes] = all cell states (interleaved by node, then state)
+    n_total  = solution_size(odeform)
+    u₀_cpu   = zeros(_T, n_total)
+
+    heat_dofrange  = odeform.solution_indices[1]   # 1:n_nodes
+    ionic_dofrange = odeform.solution_indices[2]   # 1:n_states*n_nodes
+    ionic_model_inner = odeform.functions[2].ode   # PointwiseODEFunction → .ode is ionic model
+
+    u0_cell  = Thunderbolt.default_initial_state(ionic_model_inner, nothing)
+    n_nodes  = length(heat_dofrange)
     n_states = Thunderbolt.num_states(ionic_model_inner)
-    s0flat = @view u₀[ionic_dofrange]
-    s0mat  = reshape(s0flat, (n_dofs, n_states))
+
+    # Reshape as (n_nodes × n_states) matrix and fill each column (state k)
+    s0flat = @view u₀_cpu[ionic_dofrange]
+    s0mat  = reshape(s0flat, (n_nodes, n_states))
     for k in 1:n_states
         s0mat[:, k] .= u0_cell[k]
     end
 
-    # ---- Assembled diffusion operator (for ECG) ----
-    strategy = Thunderbolt.SequentialAssemblyStrategy(Thunderbolt.SequentialCPUDevice())
-    diff_op  = Thunderbolt.setup_assembled_operator(
-        strategy,
-        Thunderbolt.BilinearDiffusionIntegrator(κ_coeff, QuadratureRuleCollection(2), :φₘ),
-        Thunderbolt.ThreadedSparseMatrixCSR{_T, Int32},
+    u₀ = USE_GPU ? CuVector(u₀_cpu) : u₀_cpu
+
+    # ---- Assembled diffusion operator (for ECG computation — always on CPU) ----
+    cpu_strategy = SequentialAssemblyStrategy(SequentialCPUDevice())
+    diff_op = setup_assembled_operator(
+        cpu_strategy,
+        BilinearDiffusionIntegrator(κ_coeff, QuadratureRuleCollection(2), :φₘ),
+        ThreadedSparseMatrixCSR{_T, Int32},
         odeform.functions[1].dh,
     )
-    Thunderbolt.update_operator!(diff_op, 0.0)
+    update_operator!(diff_op, 0.0)
 
     # ECG cache (Plonsey 1964 far-field formula)
-    φ₀_cpu = zeros(_T, length(heat_dofrange))
-    ecg_cache = Thunderbolt.Plonsey1964ECGGaussCache(diff_op, φ₀_cpu)
+    φ₀_cpu   = zeros(_T, n_nodes)
+    ecg_cache = Plonsey1964ECGGaussCache(diff_op, φ₀_cpu)
     electrode  = Vec(_T.((X_ELEC, Y_ELEC)))
-    κₜ         = one(_T)   # equal conductivities: σᵢ/(4π σₑ) ≈ 1/(4π)
+    κₜ         = one(_T)   # ratio σᵢ/(4π σₑ) ≈ 1/(4π)
 
     # ---- Solver: LieTrotterGodunov(BackwardEuler|diffusion, ForwardEuler|cells) ----
     ep_stepper = BackwardEulerSolver(;
-        inner_solver        = LinearSolve.KrylovJL_CG(; itmax=1000, atol=_T(1e-8), rtol=_T(1e-8)),
+        inner_solver         = KrylovJL_CG(),
         solution_vector_type = _vec_type(),
         system_matrix_type   = _mat_type(),
     )
     cell_stepper = ForwardEulerCellSolver(; solution_vector_type = _vec_type())
-    timestepper  = Thunderbolt.OS.LieTrotterGodunov((ep_stepper, cell_stepper))
+    timestepper  = LieTrotterGodunov((ep_stepper, cell_stepper))
 
-    # ---- Pre-pacing ----
+    # ---- Pre-pacing (reach steady state) ----
     verbose && @printf("  Pre-pacing %d beats...\n", prepace_beats)
     t_pre = time()
-    pre_tspan = (_T(0), _T(prepace_beats * BCL))
-    pre_prob  = Thunderbolt.OS.OperatorSplittingProblem(odeform, _vec_type()(u₀), pre_tspan)
-    pre_integ = Thunderbolt.OS.init(pre_prob, timestepper; dt=_T(DT₀), verbose=false)
-    Thunderbolt.OS.solve!(pre_integ)
-    u_prepaced = Vector{_T}(pre_integ.u)
+    pre_prob  = OperatorSplittingProblem(odeform, copy(u₀), (_T(0), _T(prepace_beats * BCL)))
+    pre_integ = init(pre_prob, timestepper; dt=_T(DT₀), verbose=false)
+    solve!(pre_integ)
+    u_prepaced = USE_GPU ? CuVector(Vector{_T}(pre_integ.u)) : copy(pre_integ.u)
     verbose && @printf("  Pre-pacing done in %.1f s\n", time() - t_pre)
 
     # ---- Measurement phase ----
     verbose && @printf("  Measuring %d beats...\n", meas_beats)
     t_meas = time()
-    meas_tspan = (_T(0), _T(meas_beats * BCL))
-    meas_prob  = Thunderbolt.OS.OperatorSplittingProblem(odeform, _vec_type()(u_prepaced), meas_tspan)
-    meas_integ = Thunderbolt.OS.init(meas_prob, timestepper; dt=_T(DT₀), verbose=false)
+    meas_prob  = OperatorSplittingProblem(odeform, u_prepaced, (_T(0), _T(meas_beats * BCL)))
+    meas_integ = init(meas_prob, timestepper; dt=_T(DT₀), verbose=false)
 
     # Record ECG at each timestep
     n_steps   = round(Int, meas_beats * BCL / DT₀)
     ecg_trace = zeros(_T, n_steps)
     step_idx  = 0
-    dh        = odeform.functions[1].dh
 
-    for (u_, t_) in Thunderbolt.OS.TimeChoiceIterator(
-            meas_integ, range(_T(0), _T(meas_beats * BCL); step=_T(DT₀)))
+    for (u_, t_) in TimeChoiceIterator(
+            meas_integ, _T(0) : _T(DT₀) : _T(meas_beats * BCL))
         step_idx += 1
         step_idx > n_steps && break
+        # Extract voltage DOFs (always CPU for ECG)
         φ_cpu = Vector{_T}(u_[heat_dofrange])
-        Thunderbolt.update_ecg!(ecg_cache, φ_cpu)
-        ecg_trace[step_idx] = Thunderbolt.evaluate_ecg(ecg_cache, electrode, κₜ)
+        update_ecg!(ecg_cache, φ_cpu)
+        ecg_trace[step_idx] = evaluate_ecg(ecg_cache, electrode, κₜ)
     end
     verbose && @printf("  Measurement done in %.1f s\n", time() - t_meas)
 
@@ -248,6 +265,7 @@ function detect_qt_intervals(ecg::Vector{T}, n_beats::Int; dt::Float64=DT₀) wh
         w  = max(1, round(Int, 0.03n))
         bl = 0.5*(mean(beat[1:w]) + mean(beat[end-w+1:end]))
 
+        # Q onset
         qe = round(Int, 0.40n)
         qd = abs.(beat[1:qe] .- bl)
         isempty(qd) && continue
@@ -257,6 +275,7 @@ function detect_qt_intervals(ecg::Vector{T}, n_beats::Int; dt::Float64=DT₀) wh
             if (qs>0 ? beat[i]>qt : beat[i]<qt); qi=i; break; end
         end
 
+        # T end
         ts = round(Int, 0.35n); te0 = round(Int, 0.95n)
         ts >= te0 && continue
         td = abs.(beat[ts:te0] .- bl)
@@ -280,12 +299,12 @@ function compute_qtvi(qts::Vector)
 end
 
 # ============================================================================
-# Main: τ_f sweep + u sweep → write CSV + save ECG traces
+# Main: τ_f sweep + u sweep → write CSV + save ECG traces (Fig A2C, A2D)
 # ============================================================================
 
 function main()
     println("="^70)
-    println("2D Tissue — ArmyHeart/Thunderbolt.jl  ($(N_EL)×$(N_EL) quads)")
+    println("2D Tissue — Thunderbolt.jl  ($(N_EL)×$(N_EL) quads, $(N_NX)×$(N_NY) nodes)")
     println("GPU=$USE_GPU  κ=$(KAPPA)mm²/ms  electrode=($(X_ELEC),$(Y_ELEC))mm")
     println("="^70)
 
@@ -342,7 +361,8 @@ function main()
             println(io, "t_ms," * join(ks, ","))
             n = minimum(length(v) for v in values(ecg_saved))
             for i in 1:n
-                println(io, "$(round((i-1)*DT₀, digits=3))," * join([string(ecg_saved[k][i]) for k in ks], ","))
+                println(io, "$(round((i-1)*DT₀, digits=3))," *
+                    join([string(ecg_saved[k][i]) for k in ks], ","))
             end
         end
         println("  → tissue2d_ecg_traces.csv")
