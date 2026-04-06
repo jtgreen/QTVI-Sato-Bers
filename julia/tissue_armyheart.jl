@@ -47,8 +47,18 @@ else
 end
 
 using Thunderbolt
-import Thunderbolt: solution_size, ThreadedSparseMatrixCSR
-using LinearSolve
+import Thunderbolt:
+    solution_size,
+    ThreadedSparseMatrixCSR,
+    SequentialAssemblyStrategy,
+    BilinearDiffusionIntegrator,
+    Plonsey1964ECGGaussCache,
+    update_ecg!,
+    evaluate_ecg,
+    setup_assembled_operator,
+    update_operator!
+import Thunderbolt.OS: LieTrotterGodunov, OperatorSplittingProblem
+using LinearSolve   # provides KrylovJL_CG
 using Statistics
 using Printf
 
