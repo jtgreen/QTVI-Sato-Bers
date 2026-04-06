@@ -62,6 +62,12 @@ using LinearSolve   # provides KrylovJL_CG
 using Statistics
 using Printf
 
+# Thunderbolt 0.0.1 bug workaround: CartesianCoordinateSystem returns Vec{2,Float32}
+# coordinates, but Adapt.adapt_storage tries to convert them to the solution element
+# type (Float64), which fails.  Tell Adapt to leave Vec arrays unchanged on CPU.
+using Adapt
+Adapt.adapt_storage(::Type{<:Array{T}}, xs::AT) where {T, AT <: AbstractArray{<:Vec}} = xs
+
 # Load our Sato-Bers ArmyHeart model
 include(joinpath(@__DIR__, "SatoArmyHeart.jl"))
 
