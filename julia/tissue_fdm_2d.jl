@@ -123,7 +123,7 @@ Cell forward Euler step: u_cells[:, i] += dt * cell_rhs(u_cells[:, i], x_i, t, m
 State layout: u_cells[state_index, node_index], state_index=1..15
 """
 KA.@kernel function sato_cell_fwd_euler_kernel!(u_cells, t, dt, model)
-    i = KA.@index(Global)   # node index 1..N_nodes
+    i = KA.@index(Global, Linear)   # node index 1..N_nodes
 
     # Compute x from node index
     ix = (i - 1) % model.nx          # 0-indexed x
