@@ -181,7 +181,7 @@ end
 Compute the deterministic RHS of the Sato-Bers model.
 `u` is the state vector (length 15), `du` is filled with derivatives.
 """
-function cell_rhs_deterministic!(du, u, model::SatoBersModel, stimulus=0.0)
+@inline function cell_rhs_deterministic!(du, u, model::SatoBersModel, stimulus=0.0)
     @inbounds begin
         # Unpack state variables from the state vector
         v   = u[1];  ci  = u[2];  cs  = u[3];  cj  = u[4];  cjp = u[5]

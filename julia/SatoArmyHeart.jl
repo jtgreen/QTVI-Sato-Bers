@@ -161,7 +161,7 @@ Compute ionic RHS + stochastic ICaL gate update for one FEM node.
   x  — 2D position (Vec{2,T} or AbstractArray); nothing → no position-dependent stim
   t  — current simulation time (ms)
 """
-function Thunderbolt.cell_rhs!(
+@inline function Thunderbolt.cell_rhs!(
     du    :: AbstractVector,
     u     :: AbstractVector,
     x,

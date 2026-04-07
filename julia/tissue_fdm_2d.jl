@@ -166,18 +166,12 @@ if USE_GPU
 end   # if USE_GPU
 
 # Unified dispatch
-cell_step!(u_cells::Matrix{Float64}, t, dt, model) =
-    cell_step_cpu!(u_cells, t, dt, model)
-
-diffusion_step!(dv::AbstractVector{Float64}, v::AbstractVector{Float64},
-                κ, dx, Nx, Ny) =
-    diffusion_step_cpu!(dv, v, κ, dx, Nx, Ny)
-
-if USE_GPU
-    cell_step!(u_cells::CuArray, t, dt, model) =
-        cell_step_gpu!(u_cells, t, dt, model)
-    diffusion_step!(dv::CuArray, v::CuArray, κ, dx, Nx, Ny) =
-        diffusion_step_gpu!(dv, v, κ, dx, Nx, Ny)
+if !USE_GPU
+    cell_step!(u_cells, t, dt, model) = cell_step_cpu!(u_cells, t, dt, model)
+    diffusion_step!(dv, v, κ, dx, Nx, Ny) = diffusion_step_cpu!(dv, v, κ, dx, Nx, Ny)
+else
+    cell_step!(u_cells, t, dt, model) = cell_step_gpu!(u_cells, t, dt, model)
+    diffusion_step!(dv, v, κ, dx, Nx, Ny) = diffusion_step_gpu!(dv, v, κ, dx, Nx, Ny)
 end
 
 # ============================================================
