@@ -1,9 +1,9 @@
 #!/usr/bin/env julia
-"""
+#"""
 tissue_quick.jl — Fast 2D tissue simulation (20×20 mesh) for Fig A2 demo.
 
 Demonstrates QTVi vs τ_f trend on a smaller mesh for faster results.
-"""
+#"""
 using Thunderbolt
 using LinearSolve: KrylovJL_CG
 using LinearAlgebra; using Statistics; using Printf; using Adapt
