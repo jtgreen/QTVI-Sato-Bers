@@ -48,9 +48,6 @@ using Statistics
 using Printf
 using Thunderbolt   # for Vec type + cell_rhs! interface
 
-# Include ArmyHeart FDM components
-include(joinpath(ARMYHEART_FDM, "grid.jl"))     # LazyGrid
-
 # Include our SatoBers ArmyHeart cell model
 include(joinpath(@__DIR__, "SatoArmyHeart.jl"))
 
