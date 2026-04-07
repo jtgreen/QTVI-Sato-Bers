@@ -90,12 +90,9 @@ function SatoBersArmyModel(;
     rng_cpu = UInt32[seed ⊻ (UInt32(i % typemax(UInt32)) * UInt32(0x27220A95) + UInt32(0x374761A1)) for i in 1:n]
 
     if use_gpu
-        # Load CUDA and create CuVector for RNG states
-        @eval using CUDA
-        rng_states = CuVector{UInt32}(rng_cpu)
-    else
-        rng_states = rng_cpu
+        error("use_gpu=true deprecated. Create CPU model then call Adapt.adapt(CuArray, model).")
     end
+    rng_states = rng_cpu
 
     return SatoBersArmyModel{Float64, typeof(rng_states)}(
         sato, rng_states, nx, ny,
@@ -122,23 +119,9 @@ function SatoBersArmyModel_gpu(m::SatoBersArmyModel{T, Vector{UInt32}}) where T
     )
 end
 
-# Adapt.jl: for CuArray adapter, convert rng_states
-function Adapt.adapt_structure(to::Type{CuArray}, m::SatoBersArmyModel{T, Vector{UInt32}}) where T
-    cu_rng = CuVector{UInt32}(m.rng_states)
-    return SatoBersArmyModel{T, typeof(cu_rng)}(
-        m.sato, cu_rng, m.nx, m.ny,
-        m.dx, m.dy, m.dt, m.bcl, m.stim_amp, m.stim_dur, m.corner_mm,
-    )
-end
-
-# For the CUDA adapter (cuda's cu function), also convert
-function Adapt.adapt_structure(to::CUDA.CuArrayAdaptor, m::SatoBersArmyModel{T, Vector{UInt32}}) where T
-    cu_rng = CuVector{UInt32}(m.rng_states)
-    return SatoBersArmyModel{T, typeof(cu_rng)}(
-        m.sato, cu_rng, m.nx, m.ny,
-        m.dx, m.dy, m.dt, m.bcl, m.stim_amp, m.stim_dur, m.corner_mm,
-    )
-end
+# Adapt.jl: auto-adapt all AbstractArray fields (rng_states: Vector → CuArray on GPU)
+# Use Adapt.@adapt_structure for correct recursive adaptation
+Adapt.@adapt_structure SatoBersArmyModel
 
 # ============================================================================
 # Thunderbolt AbstractIonicModel interface
